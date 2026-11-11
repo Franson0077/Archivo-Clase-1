@@ -61,9 +61,14 @@ class AsyncLLMManager:
         self.provider = provider or os.getenv("LLM_PROVIDER", "anthropic")
         self._check_known(self.provider, "LLM_PROVIDER")
 
-        # Proveedor de respaldo: mismo patron (argumento > .env). Si la variable
-        # no existe o esta vacia, no hay respaldo (None).
-        self.fallback_provider = fallback_provider or os.getenv("LLM_FALLBACK_PROVIDER") or None
+        # Proveedor de respaldo: mismo patron (argumento > .env), con un detalle:
+        #   fallback_provider=None -> "no lo indico": se lee LLM_FALLBACK_PROVIDER.
+        #   fallback_provider=""   -> "sin respaldo", aunque .env tenga uno.
+        # Por eso se compara con "is None" y no con "or": "" tambien es falso
+        # para "or", y se perderia la diferencia entre ambos casos.
+        if fallback_provider is None:
+            fallback_provider = os.getenv("LLM_FALLBACK_PROVIDER")
+        self.fallback_provider = fallback_provider or None
         if self.fallback_provider is not None:
             self._check_known(self.fallback_provider, "LLM_FALLBACK_PROVIDER")
             if self.fallback_provider == self.provider:

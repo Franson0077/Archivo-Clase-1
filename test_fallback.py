@@ -228,6 +228,16 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             AsyncLLMManager(provider="inexistente")
 
+    def test_respaldo_vacio_desactiva_el_de_env(self):
+        # Bug encontrado probando con las APIs reales: fallback_provider=""
+        # se ignoraba y se usaba el respaldo del .env igual.
+        with patch.dict(os.environ, {"LLM_FALLBACK_PROVIDER": "openai"}):
+            manager = AsyncLLMManager(provider="openai", fallback_provider="")
+            self.assertEqual(manager.providers, ["openai"])
+            # None (no indicarlo) si sigue leyendo el .env:
+            manager = AsyncLLMManager(provider="anthropic")
+            self.assertEqual(manager.providers, ["anthropic", "openai"])
+
     def test_respaldo_igual_al_principal_es_invalido(self):
         with self.assertRaises(ValueError):
             AsyncLLMManager(provider="anthropic", fallback_provider="anthropic")
