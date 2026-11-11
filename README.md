@@ -2,15 +2,28 @@
 
 Proyecto de ejemplo para configurar modelos OpenAI o Anthropic de forma asincrona.
 
+## Estructura del proyecto
+
+```text
+schemas.py        -> QUE datos entran y salen (GenerationParams, LLMError)
+providers.py      -> COMO se habla con cada API (BaseProvider + una clase por proveedor)
+llm_manager.py    -> QUE proveedor usar y QUE hacer si falla (AsyncLLMManager)
+main.py           -> script de prueba interactivo
+test_fallback.py  -> pruebas automaticas sin gastar tokens
+```
+
+Cada archivo depende solo de los de arriba: `schemas.py` no conoce a nadie,
+`providers.py` usa `schemas.py`, y `llm_manager.py` usa a los dos.
+
 ## Mapa de la consigna
 
 | Punto | Consigna | Dónde está |
 |---|---|---|
 | 1 | Entorno virtual + openai, anthropic, pydantic, python-dotenv | `requirements.txt`, sección *Instalacion* |
-| 2 | Esquema Pydantic (temperatura 0–2, max_tokens, etc.) | `llm_manager.py` → `GenerationParams` |
-| 3 | `AsyncLLMManager` que carga OpenAI o Anthropic según configuración | `llm_manager.py` → `AsyncLLMManager.__init__` + `LLM_PROVIDER` |
-| 4 | Streaming con `yield` | `llm_manager.py` → `generate`, `_generate_openai`, `_generate_anthropic` |
-| 5 | Errores de red y rate limit controlados | `llm_manager.py` → `LLMError`, `generate`, `_classify_error` (con respaldo a OpenAI) |
+| 2 | Esquema Pydantic (temperatura 0–2, max_tokens, etc.) | `schemas.py` → `GenerationParams` |
+| 3 | `AsyncLLMManager` que carga OpenAI o Anthropic según configuración | `llm_manager.py` → `AsyncLLMManager.__init__` + `LLM_PROVIDER`; `providers.py` → `PROVIDERS` |
+| 4 | Streaming con `yield` | `providers.py` → `stream()` de cada proveedor; `llm_manager.py` → `generate` |
+| 5 | Errores de red y rate limit controlados | `schemas.py` → `LLMError`; `providers.py` → `classify_error`; `llm_manager.py` → `generate` |
 | 6 | README con ejecución y variables de entorno | este archivo |
 | Prueba | Demostración de los puntos 2 y 5 sin gastar tokens | `test_fallback.py` |
 
@@ -118,6 +131,8 @@ con Python, así que no hay que instalar nada extra. Comprueba que:
 - Pydantic rechaza parámetros fuera de rango (punto 2).
 - Cada error termina en un `LLMError` controlado, sin crash (punto 5).
 - Si Anthropic se cae, se usa OpenAI con la `temperature` y el `top_p` validados.
+- Se puede sumar un proveedor nuevo (`EchoProvider`, de juguete) sin tocar
+  `llm_manager.py`.
 - Un bug de nuestro propio código no se disfraza de error de la API.
 
 ## Respaldo automatico (Anthropic -> OpenAI)
@@ -144,24 +159,67 @@ Cuando entra OpenAI se usan `temperature` y `top_p` tal como se validaron en
 
 ## Guia rapida del codigo
 
+**`schemas.py`**
+
 - `GenerationParams`: estructura Pydantic para validar `prompt`, `temperature`,
   `max_tokens`, `top_p` y `system`.
 - `LLMError`: error controlado con `kind` (`RATE_LIMIT`, `NETWORK`, `SERVER`,
   `PROVIDER`), `provider` y `message`.
+
+**`providers.py`**
+
+- `BaseProvider`: clase base abstracta. Define lo que todo proveedor tiene que
+  saber hacer: `create_client()`, `stream()` y `classify_error()`. También lee
+  la clave y el modelo desde `.env`.
+- `OpenAIProvider` y `AnthropicProvider`: implementan esos métodos con su SDK.
+  `stream()` entrega fragmentos con `yield` y no captura errores: los deja subir
+  al manager.
+- `PROVIDERS`: diccionario `{"openai": OpenAIProvider, ...}`. Es el registro de
+  proveedores que se pueden elegir desde `.env`.
+
+**`llm_manager.py`**
+
 - `AsyncLLMManager.__init__`: lee `LLM_PROVIDER`, `LLM_FALLBACK_PROVIDER`,
-  `LLM_MAX_RETRIES` y `LLM_TIMEOUT` y crea los clientes necesarios.
-- `AsyncLLMManager.generate`: recorre los proveedores en orden, reenvia los
+  `LLM_MAX_RETRIES` y `LLM_TIMEOUT`, busca cada proveedor en `PROVIDERS` y lo
+  crea. No tiene ningún `if openai / else anthropic`.
+- `AsyncLLMManager.generate`: recorre los proveedores en orden, reenvía los
   fragmentos mediante `yield` y decide si usar el respaldo. Entrega textos
   (`str`) y, si algo falla, un único `LLMError` al final.
-- `_classify_error`: traduce el error a `RATE_LIMIT`, `NETWORK` o `SERVER`.
-- `_generate_openai` y `_generate_anthropic`: llaman a cada API y reciben texto
-  parcial. No capturan errores: los dejan subir a `generate()`.
-- `main.py`: pide el prompt, crea los parametros, inicia el gestor y muestra cada
-  fragmento sin esperar la respuesta completa.
 
-El punto 5 esta implementado en `LLMError`, `generate()` y `_classify_error()`.
-El error se devuelve como un objeto, no como texto, para que el código que
-consume el stream (por ejemplo, un agente) pueda reaccionar según el tipo:
+**`main.py`**: pide el prompt, crea los parámetros, inicia el gestor y muestra
+cada fragmento sin esperar la respuesta completa.
+
+## Como agregar un proveedor nuevo
+
+1. En `providers.py`, crear una clase que herede de `BaseProvider`:
+
+   ```python
+   class MistralProvider(BaseProvider):
+       name = "mistral"
+       api_key_env = "MISTRAL_API_KEY"
+       model_env = "MISTRAL_MODEL"
+       default_model = "mistral-small"
+       rate_limit_errors = (...)   # errores de rate limit de su SDK
+       network_errors = (...)      # errores de red
+       server_errors = (...)       # errores 5xx
+       api_error = ...             # clase madre de los errores del SDK
+
+       def create_client(self, api_key, max_retries, timeout): ...
+       async def stream(self, params): ...   # yield de cada fragmento
+   ```
+
+2. Registrarla en el diccionario `PROVIDERS` (una línea).
+3. Usarla desde `.env`: `LLM_PROVIDER=mistral` o `LLM_FALLBACK_PROVIDER=mistral`.
+
+No hace falta tocar `llm_manager.py` ni `main.py`. `test_fallback.py` lo
+demuestra con `EchoProvider`, un proveedor de juguete.
+
+## Que errores se controlan
+
+El punto 5 está implementado en `LLMError` (`schemas.py`), `classify_error()`
+(`providers.py`) y `generate()` (`llm_manager.py`). El error se devuelve como un
+objeto, no como texto, para que el código que consume el stream (por ejemplo,
+un agente) pueda reaccionar según el tipo:
 
 ```python
 async for fragmento in manager.generate(params):
@@ -178,8 +236,14 @@ async for fragmento in manager.generate(params):
 | `InternalServerError` (incluye `OverloadedError` de Anthropic) | `SERVER` |
 | Cualquier otro `APIError` (clave inválida, petición mal armada) | `PROVIDER` |
 
-Los errores que no vienen de la API (un bug de nuestro código) **no** se
-capturan: se ven con su traceback completo para poder corregirlos.
+**Alcance.** El "error controlado en lugar de un crash" cubre los errores **de
+la API** durante la generación. Hay dos casos que, a propósito, **no** se
+convierten en `LLMError`:
+
+| Caso | Qué pasa | Por qué |
+|---|---|---|
+| Falta una clave o `LLM_PROVIDER` es inválido | `ValueError` al crear `AsyncLLMManager()` | Es un error de configuración: se detecta al iniciar, antes de generar nada. `main.py` lo captura y muestra `Configuracion invalida: ...`. |
+| Bug de nuestro código (ej. `AttributeError`) | Se propaga con su traceback | Disfrazarlo de error del proveedor escondería el problema real. Lo comprueba `test_un_bug_de_codigo_no_se_disfraza_de_error_de_api`. |
 
 ## Nota sobre Anthropic
 

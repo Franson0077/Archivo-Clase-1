@@ -15,7 +15,8 @@ import sys
 
 from pydantic import ValidationError
 
-from llm_manager import AsyncLLMManager, GenerationParams, LLMError
+from llm_manager import AsyncLLMManager
+from schemas import GenerationParams, LLMError
 
 
 async def main() -> None:

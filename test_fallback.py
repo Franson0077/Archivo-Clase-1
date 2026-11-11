@@ -4,23 +4,28 @@ test_fallback.py - Pruebas SIN llamar a las APIs (no gasta tokens ni necesita in
 Ejecutar:
     python -m unittest -v test_fallback
 
-Idea central: reemplazamos _generate_anthropic y _generate_openai por funciones
-FALSAS (fakes) que devuelven texto o lanzan el error que queramos. Asi podemos
-"simular" una caida de Anthropic cuando queramos y comprobar que:
+Idea central: reemplazamos el metodo stream() de cada proveedor por una
+funcion FALSA (fake) que devuelve texto o lanza el error que queramos. Asi
+podemos "simular" una caida de Anthropic cuando queramos y comprobar que:
     PUNTO 2 -> Pydantic rechaza parametros invalidos.
-    PUNTO 5 -> cada error termina en un LLMError controlado (sin crash).
+    PUNTO 5 -> cada error de la API termina en un LLMError controlado.
     Extra   -> si Anthropic se cae, se usa OpenAI con la temperatura validada.
+    Extra   -> se puede sumar un proveedor nuevo sin tocar llm_manager.py.
 """
 
 import os
 import unittest
+from typing import AsyncIterator
 from unittest.mock import patch
 
 import anthropic
-import httpx2  # libreria HTTP que usan los SDK; la necesitamos para armar errores falsos
+import httpx2
+import openai  # libreria HTTP que usan los SDK; la necesitamos para armar errores falsos
 from pydantic import ValidationError
 
-from llm_manager import AsyncLLMManager, GenerationParams, LLMError
+from llm_manager import AsyncLLMManager
+from providers import PROVIDERS, BaseProvider
+from schemas import GenerationParams, LLMError
 
 # Claves falsas: los clientes se crean pero nunca se conectan a nada.
 FAKE_ENV = {"ANTHROPIC_API_KEY": "fake-anthropic", "OPENAI_API_KEY": "fake-openai"}
@@ -37,6 +42,12 @@ def http_error(error_class, status_code: int):
 
 def network_error():
     return anthropic.APIConnectionError(request=_REQUEST)
+
+
+def openai_network_error():
+    # Cada proveedor reconoce SOLO los errores de su propio SDK, asi que una
+    # caida de OpenAI se simula con un error de openai, no de anthropic.
+    return openai.APIConnectionError(request=_REQUEST)
 
 
 async def collect(manager, params):
@@ -81,8 +92,11 @@ class FallbackTests(unittest.IsolatedAsyncioTestCase):
 
             return fake_stream
 
-        manager._generate_anthropic = fake("anthropic", anthropic_behaviour)
-        manager._generate_openai = fake("openai", openai_behaviour)
+        # Se reemplaza stream() SOLO en este objeto (no en la clase), asi el
+        # resto del proveedor (classify_error, nombre...) sigue siendo el real.
+        manager.get_provider("anthropic").stream = fake("anthropic", anthropic_behaviour)
+        if fallback:
+            manager.get_provider("openai").stream = fake("openai", openai_behaviour)
         return manager
 
     def params(self):
@@ -137,7 +151,7 @@ class FallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(e.kind, e.provider) for e in errors], [("RATE_LIMIT", "anthropic")])
 
     async def test_si_el_respaldo_tambien_falla_devuelve_error(self):
-        manager = self.make_manager(network_error(), openai_behaviour=network_error())
+        manager = self.make_manager(network_error(), openai_behaviour=openai_network_error())
         text, errors = await collect(manager, self.params())
         self.assertEqual(text, "")
         self.assertEqual([(e.kind, e.provider) for e in errors], [("NETWORK", "openai")])
@@ -150,6 +164,50 @@ class FallbackTests(unittest.IsolatedAsyncioTestCase):
             await collect(manager, self.params())
 
 
+# --- Extensibilidad: un tercer proveedor sin tocar llm_manager.py -------------
+
+class EchoProvider(BaseProvider):
+    """Proveedor de juguete: repite el prompt. No usa red ni ningun SDK."""
+
+    name = "echo"
+    api_key_env = "ECHO_API_KEY"
+    model_env = "ECHO_MODEL"
+    default_model = "echo-1"
+    api_error = ConnectionRefusedError  # cualquier clase de error sirve de ejemplo
+
+    def create_client(self, api_key, max_retries, timeout):
+        return None  # no necesita cliente
+
+    async def stream(self, params: GenerationParams) -> AsyncIterator[str]:
+        for word in params.prompt.split():
+            yield word + " "
+
+
+@patch.dict(os.environ, {**FAKE_ENV, "ECHO_API_KEY": "fake-echo"})
+@patch.dict(PROVIDERS, {"echo": EchoProvider})
+class ExtensibilityTests(unittest.IsolatedAsyncioTestCase):
+    # @patch.dict(PROVIDERS, ...) registra "echo" solo durante este test.
+    # Es exactamente lo que haria un proveedor real: agregar UNA linea a
+    # PROVIDERS. AsyncLLMManager no se modifico para nada.
+
+    async def test_nuevo_proveedor_funciona_sin_cambiar_el_manager(self):
+        manager = AsyncLLMManager(provider="echo", fallback_provider="")
+        text, errors = await collect(manager, GenerationParams(prompt="hola mundo"))
+        self.assertEqual(text, "hola mundo ")
+        self.assertEqual(errors, [])
+
+    async def test_nuevo_proveedor_puede_ser_respaldo(self):
+        manager = AsyncLLMManager(provider="anthropic", fallback_provider="echo")
+
+        async def caida(params):
+            raise network_error()
+            yield
+
+        manager.get_provider("anthropic").stream = caida
+        text, errors = await collect(manager, GenerationParams(prompt="respaldo echo"))
+        self.assertEqual(text, "respaldo echo ")
+
+
 @patch.dict(os.environ, FAKE_ENV)
 class ConfigTests(unittest.TestCase):
 
@@ -157,8 +215,18 @@ class ConfigTests(unittest.TestCase):
         manager = AsyncLLMManager(
             provider="anthropic", fallback_provider="openai", max_retries=0, timeout=15
         )
-        self.assertEqual(manager._anthropic.max_retries, 0)
-        self.assertEqual(manager._openai.timeout, 15)
+        self.assertEqual(manager.get_provider("anthropic").client.max_retries, 0)
+        self.assertEqual(manager.get_provider("openai").client.timeout, 15)
+
+    def test_modelo_por_argumento(self):
+        manager = AsyncLLMManager(
+            provider="anthropic", fallback_provider="openai", models={"openai": "gpt-test"}
+        )
+        self.assertEqual(manager.get_provider("openai").model, "gpt-test")
+
+    def test_proveedor_desconocido_es_invalido(self):
+        with self.assertRaises(ValueError):
+            AsyncLLMManager(provider="inexistente")
 
     def test_respaldo_igual_al_principal_es_invalido(self):
         with self.assertRaises(ValueError):
@@ -171,7 +239,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class ParamsTests(unittest.TestCase):
-    # PUNTO 2 - El esquema Pydantic rechaza valores fuera de rango.
+    # PUNTO 2 - El esquema Pydantic (schemas.py) rechaza valores fuera de rango.
 
     def test_rechaza_parametros_invalidos(self):
         invalidos = [
